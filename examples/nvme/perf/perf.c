@@ -124,7 +124,7 @@ struct ns_worker_ctx {
 
 	union {
 		struct {
-			struct spdk_nvme_qpair	*qpair;
+			struct spdk_nvme_qpair  **qpair;
 		} nvme;
 
 #if HAVE_LIBAIO
@@ -196,6 +196,7 @@ static uint32_t g_metacfg_prchk_flags;
 static int g_rw_percentage;
 static int g_is_random;
 static int g_queue_depth;
+static int g_num_pair = 1;
 static int g_time_in_sec;
 static uint32_t g_max_completions;
 static int g_dpdk_mem;
@@ -475,7 +476,8 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 	}
 
 	if (task->is_read) {
-		return spdk_nvme_ns_cmd_read_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair,
+		return spdk_nvme_ns_cmd_read_with_md(entry->u.nvme.ns,
+                ns_ctx->u.nvme.qpair[offset_in_ios % g_num_pair],
 						     task->iov.iov_base, task->md_iov.iov_base,
 						     lba,
 						     entry->io_size_blocks, io_complete,
@@ -502,7 +504,7 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 			break;
 		}
 
-		return spdk_nvme_ns_cmd_write_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair,
+		return spdk_nvme_ns_cmd_write_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[offset_in_ios % g_num_pair],
 						      task->iov.iov_base, task->md_iov.iov_base,
 						      lba,
 						      entry->io_size_blocks, io_complete,
@@ -514,7 +516,10 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 static void
 nvme_check_io(struct ns_worker_ctx *ns_ctx)
 {
-	spdk_nvme_qpair_process_completions(ns_ctx->u.nvme.qpair, g_max_completions);
+    int i;
+    for (i = 0; i < g_num_pair; i++) {
+	    spdk_nvme_qpair_process_completions(ns_ctx->u.nvme.qpair[i], g_max_completions);
+    }
 }
 
 static void
@@ -554,18 +559,22 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 {
 	struct spdk_nvme_io_qpair_opts opts;
 	struct ns_entry *entry = ns_ctx->entry;
+    int i = 0;
 
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(entry->u.nvme.ctrlr, &opts, sizeof(opts));
 	if (opts.io_queue_requests < entry->num_io_requests) {
 		opts.io_queue_requests = entry->num_io_requests;
 	}
 
-	ns_ctx->u.nvme.qpair = spdk_nvme_ctrlr_alloc_io_qpair(entry->u.nvme.ctrlr, &opts,
-			       sizeof(opts));
-	if (!ns_ctx->u.nvme.qpair) {
-		printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair failed\n");
-		return -1;
-	}
+    ns_ctx->u.nvme.qpair = calloc(g_num_pair, sizeof(struct spdk_nvme_qpair*));
+    for (i = 0; i < g_num_pair; i++) {
+        ns_ctx->u.nvme.qpair[i] = spdk_nvme_ctrlr_alloc_io_qpair(entry->u.nvme.ctrlr, &opts,
+                       sizeof(opts));
+        if (!ns_ctx->u.nvme.qpair[i]) {
+            printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair failed\n");
+            return -1;
+        }
+    }
 
 	return 0;
 }
@@ -573,7 +582,11 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 static void
 nvme_cleanup_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 {
-	spdk_nvme_ctrlr_free_io_qpair(ns_ctx->u.nvme.qpair);
+    int i;
+
+    for (i = 0; i < g_num_pair; i++) {
+	    spdk_nvme_ctrlr_free_io_qpair(ns_ctx->u.nvme.qpair[i]);
+    }
 }
 
 static const struct ns_fn_table nvme_fn_table = {
@@ -994,6 +1007,7 @@ static void usage(char *program_name)
 	printf("\t[-q io depth]\n");
 	printf("\t[-o io size in bytes]\n");
 	printf("\t[-w io pattern type, must be one of\n");
+	printf("\t[-p number of io queue qpir]\n");
 	printf("\t\t(read, write, randread, randwrite, rw, randrw)]\n");
 	printf("\t[-M rwmixread (100 for reads, 0 for writes)]\n");
 	printf("\t[-L enable latency tracking via sw, default: disabled]\n");
@@ -1425,7 +1439,7 @@ parse_args(int argc, char **argv)
 	g_core_mask = NULL;
 	g_max_completions = 0;
 
-	while ((op = getopt(argc, argv, "c:e:i:lm:o:q:r:s:t:w:DHILM:")) != -1) {
+	while ((op = getopt(argc, argv, "c:e:i:lm:o:q:r:s:t:w:p:DHILM:")) != -1) {
 		switch (op) {
 		case 'i':
 		case 'm':
@@ -1433,6 +1447,7 @@ parse_args(int argc, char **argv)
 		case 'q':
 		case 's':
 		case 't':
+		case 'p':
 		case 'M':
 			val = spdk_strtol(optarg, 10);
 			if (val < 0) {
@@ -1451,6 +1466,9 @@ parse_args(int argc, char **argv)
 				break;
 			case 'q':
 				g_queue_depth = val;
+				break;
+			case 'p':
+				g_num_pair = val;
 				break;
 			case 's':
 				g_dpdk_mem = val;
@@ -1654,6 +1672,7 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		printf("Attaching to NVMe Controller at %s\n",
 		       trid->traddr);
 	}
+    opts->num_io_queues = g_num_pair;
 
 	/* Set io_queue_size to UINT16_MAX, NVMe driver
 	 * will then reduce this to MQES to maximize
